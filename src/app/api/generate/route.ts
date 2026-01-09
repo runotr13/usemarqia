@@ -57,14 +57,23 @@ async function normalizeToBuffer(imageInput: string) {
   throw new Error("imageInput must be a data URL or an http(s) URL");
 }
 
+/**
+ * Extract a single JSON object from model output.
+ * - Accepts raw JSON or fenced JSON.
+ * - If model adds extra text, we slice from first "{" to last "}".
+ * Note: We also instruct model to return ONE JSON object only.
+ */
 function extractJsonObject(text: string) {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   const candidate = (fenced ? fenced[1] : text).trim();
+
   const start = candidate.indexOf("{");
   const end = candidate.lastIndexOf("}");
+
   if (start === -1 || end === -1 || end <= start) {
     throw new Error("No JSON object found in model output");
   }
+
   return candidate.slice(start, end + 1);
 }
 
@@ -94,7 +103,7 @@ function buildSchema(
       `  "ecommerce_title": "string (max ${limits.ecommerce_title_max} chars)"`
     );
     fields.push(
-      `  "ecommerce_description": "string (max ${limits.ecommerce_description_max} chars, 1-2 short paragraphs)"`
+      `  "ecommerce_description": "string (max ${limits.ecommerce_description_max} chars)"`
     );
   }
 
@@ -103,10 +112,10 @@ function buildSchema(
       `  "instagram_title": "string (max ${limits.instagram_title_max} chars)"`
     );
     fields.push(
-      `  "instagram_description": "string (max ${limits.instagram_description_max} chars, 1-2 short paragraphs)"`
+      `  "instagram_description": "string (max ${limits.instagram_description_max} chars)"`
     );
     fields.push(
-      `  "hashtags": ["string", "..."] (${limits.hashtags_min}-${limits.hashtags_max} relevant hashtags, without # prefix)`
+      `  "hashtags": ["string", "..."] // ${limits.hashtags_min}-${limits.hashtags_max} items, no # prefix`
     );
   }
 
@@ -121,6 +130,7 @@ function buildPrompt(params: {
 }) {
   const { contentTypes, tone, userPrompt, limits } = params;
 
+  // Hard limit rules (mirrors schema)
   const limitRules: string[] = [];
   if (contentTypes.includes("ecommerce")) {
     limitRules.push(`ecommerce_title <= ${limits.ecommerce_title_max} chars`);
@@ -138,18 +148,30 @@ function buildPrompt(params: {
     );
   }
 
+  const defaultLanguageRule = userPrompt
+    ? "If user specifies language, generate ALL fields ONLY in that language."
+    : "DEFAULT LANGUAGE: Turkish (unless user explicitly requests another language).";
+
+  const emojiRule = contentTypes.includes("ecommerce")
+    ? "E-COMMERCE ONLY: No emojis in ecommerce_title/ecommerce_description."
+    : "";
+
   const baseRules = [
+    "Return ONE single JSON object only.",
     "Return ONLY valid JSON. No markdown, no extra text.",
-    "DEFAULT LANGUAGE: Turkish (unless user explicitly requests another language).",
-    "No emojis in titles/descriptions.",
-    "Be specific and clear.",
+    defaultLanguageRule,
+    emojiRule,
+    "Be specific and clear. Avoid vague claims.",
     `Use this tone for ALL fields:\n${toneGuideline(tone)}`,
+    "If character limits are very small, prioritize brevity and keep only the most important benefits.",
     `HARD LIMITS (do NOT exceed):\n- ${limitRules.join("\n- ")}`,
-    "Hashtags must be plain words (no #) and lowercased if possible.",
-  ].join("\n\n");
+    "Hashtags rules: plain words (no #), no spaces, prefer lowercase, relevant only.",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
   const userBlock = userPrompt
-    ? `SPECIAL USER REQUEST:\n${userPrompt}\n\nIMPORTANT: If user specifies language, generate ALL fields only in that language.`
+    ? `SPECIAL USER REQUEST (higher priority than defaults):\n${userPrompt}`
     : "";
 
   const schema = buildSchema(contentTypes, limits);
@@ -158,7 +180,7 @@ function buildPrompt(params: {
     "Analyze the product image and generate marketing content.",
     `REQUESTED CONTENT TYPES: ${contentTypes.join(", ")}`,
     userBlock,
-    "JSON FORMAT (exact keys):",
+    "JSON FORMAT (exact keys; do not add new keys):",
     schema,
     "RULES:",
     baseRules,
@@ -204,27 +226,33 @@ export async function POST(req: Request) {
 
     const b64 = resized.buffer.toString("base64");
     const mime = resized.mime;
+
     const ai = new GoogleGenAI({ apiKey: requireEnv("GEMINI_API_KEY") });
+
+    const prompt = buildPrompt({
+      contentTypes: body.contentTypes,
+      tone,
+      userPrompt: body.userPrompt,
+      limits,
+    });
 
     const response = await ai.models.generateContent({
       model: MODEL,
       contents: [
-        { inlineData: { mimeType: mime, data: b64 } },
         {
-          text: buildPrompt({
-            contentTypes: body.contentTypes,
-            tone,
-            userPrompt: body.userPrompt,
-            limits,
-          }),
+          role: "user",
+          parts: [
+            { inlineData: { mimeType: mime, data: b64 } },
+            { text: prompt },
+          ],
         },
       ],
       config: { temperature: 0.7 },
     });
 
     const rawText = response.text ?? "";
-    let data: unknown;
 
+    let data: unknown;
     try {
       data = JSON.parse(extractJsonObject(rawText));
     } catch {
